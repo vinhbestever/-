@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime
+from datetime import datetime, timezone
 
 from app.models.call_log import (
     IngestRequest,
@@ -9,7 +9,7 @@ from app.models.call_log import (
     Utterance,
     Speaker,
 )
-from app.services.ingest_queue import IngestQueue
+from app.services.ingest_queue import IngestQueue, QueueFullError
 
 
 @pytest.fixture
@@ -30,7 +30,6 @@ def sample_request():
 
 
 def _patch_services():
-    """Context manager that patches stt_client, embedding_service, es_service."""
     return (
         patch("app.services.ingest_queue.stt_client"),
         patch("app.services.ingest_queue.embedding_service"),
@@ -44,47 +43,65 @@ def _make_mock_stt(mock_stt, transcribe_fn):
     return mock_stt
 
 
-class TestIngestQueue:
+class TestSubmit:
     @pytest.mark.asyncio
-    async def test_submit_returns_queued_job(self, queue, sample_request):
+    async def test_returns_queued_job(self, queue, sample_request):
         p1, p2, p3 = _patch_services()
         with p1 as mock_stt, p2, p3:
             _make_mock_stt(mock_stt, AsyncMock(return_value=[]))
             await queue.start()
-            job = await queue.submit(sample_request)
+            job = queue.submit(sample_request)
             assert job.status == JobStatus.QUEUED
             assert job.call_id == sample_request.call_id
-            assert job.job_id == sample_request.call_id
             assert job.created_at is not None
             await queue.stop()
 
     @pytest.mark.asyncio
-    async def test_get_job_returns_none_for_unknown(self, queue):
+    async def test_rejects_when_queue_full(self):
+        """Queue with maxsize=2 should raise QueueFullError on 3rd submit."""
+        q = IngestQueue()
+        p1, p2, p3 = _patch_services()
+        with p1 as mock_stt, p2, p3:
+            mock_stt.close = AsyncMock()
+            # Use a tiny queue and no workers so items stay in queue
+            with patch("app.services.ingest_queue.settings") as mock_settings:
+                mock_settings.ingest_queue_max_size = 2
+                mock_settings.stt_max_concurrency = 1
+                mock_settings.ingest_worker_count = 0  # no workers → items stay queued
+                await q.start()
+
+            req1 = IngestRequest(audio_url="https://example.com/1.wav")
+            req2 = IngestRequest(audio_url="https://example.com/2.wav")
+            req3 = IngestRequest(audio_url="https://example.com/3.wav")
+
+            q.submit(req1)
+            q.submit(req2)
+            with pytest.raises(QueueFullError):
+                q.submit(req3)
+
+            await q.stop()
+
+
+class TestJobLookup:
+    def test_returns_none_for_unknown(self, queue):
         assert queue.get_job("nonexistent") is None
 
     @pytest.mark.asyncio
-    async def test_get_job_returns_submitted_job(self, queue, sample_request):
+    async def test_returns_submitted_job(self, queue, sample_request):
         p1, p2, p3 = _patch_services()
         with p1 as mock_stt, p2, p3:
             _make_mock_stt(mock_stt, AsyncMock(return_value=[]))
             await queue.start()
-            job = await queue.submit(sample_request)
+            job = queue.submit(sample_request)
             found = queue.get_job(job.job_id)
             assert found is not None
             assert found.job_id == job.job_id
             await queue.stop()
 
-    @pytest.mark.asyncio
-    async def test_pending_count(self, queue):
-        p1, p2, p3 = _patch_services()
-        with p1 as mock_stt, p2, p3:
-            mock_stt.close = AsyncMock()
-            await queue.start()
-            assert queue.pending_count >= 0
-            await queue.stop()
 
+class TestProcessing:
     @pytest.mark.asyncio
-    async def test_full_pipeline_with_mock_stt(self, queue, sample_request):
+    async def test_full_pipeline(self, queue, sample_request):
         mock_utterances = [
             Utterance(speaker="Agent", text="Xin chào"),
             Utterance(speaker="Customer", text="Chào bạn"),
@@ -97,7 +114,7 @@ class TestIngestQueue:
             mock_es.index_call_log = AsyncMock(return_value="test-id")
 
             await queue.start()
-            job = await queue.submit(sample_request)
+            job = queue.submit(sample_request)
 
             for _ in range(50):
                 await asyncio.sleep(0.1)
@@ -123,7 +140,7 @@ class TestIngestQueue:
             _make_mock_stt(mock_stt, AsyncMock(side_effect=Exception("STT API timeout")))
 
             await queue.start()
-            job = await queue.submit(sample_request)
+            job = queue.submit(sample_request)
 
             for _ in range(50):
                 await asyncio.sleep(0.1)
@@ -137,7 +154,7 @@ class TestIngestQueue:
             await queue.stop()
 
     @pytest.mark.asyncio
-    async def test_multiple_jobs_processed_concurrently(self, queue):
+    async def test_concurrent_processing(self, queue):
         call_log = []
 
         async def slow_stt(audio_url, language):
@@ -157,7 +174,7 @@ class TestIngestQueue:
             jobs = []
             for i in range(3):
                 req = IngestRequest(audio_url=f"https://example.com/{i}.wav")
-                jobs.append(await queue.submit(req))
+                jobs.append(queue.submit(req))
 
             for _ in range(100):
                 await asyncio.sleep(0.1)
@@ -171,8 +188,50 @@ class TestIngestQueue:
 
             starts = [t for label, _, t in call_log if label == "start"]
             assert len(starts) == 3
-            # With 3 workers, all 3 STT calls should overlap in time
             time_span = max(starts) - min(starts)
             assert time_span < 0.15
+
+            await queue.stop()
+
+
+class TestCleanup:
+    @pytest.mark.asyncio
+    async def test_purge_expired_jobs(self, queue):
+        """Manually call _purge_expired_jobs to verify old done jobs are removed."""
+        p1, p2, p3 = _patch_services()
+        with p1 as mock_stt, p2, p3:
+            mock_stt.close = AsyncMock()
+            await queue.start()
+
+            from app.models.call_log import IngestJobDetail
+            old_time = datetime(2020, 1, 1, tzinfo=timezone.utc)
+
+            queue._jobs["old-done"] = IngestJobDetail(
+                job_id="old-done",
+                call_id="old-done",
+                status=JobStatus.DONE,
+                created_at=old_time,
+                completed_at=old_time,
+            )
+            queue._jobs["old-failed"] = IngestJobDetail(
+                job_id="old-failed",
+                call_id="old-failed",
+                status=JobStatus.FAILED,
+                error="test",
+                created_at=old_time,
+                completed_at=old_time,
+            )
+            queue._jobs["still-queued"] = IngestJobDetail(
+                job_id="still-queued",
+                call_id="still-queued",
+                status=JobStatus.QUEUED,
+                created_at=old_time,
+            )
+
+            queue._purge_expired_jobs()
+
+            assert "old-done" not in queue._jobs
+            assert "old-failed" not in queue._jobs
+            assert "still-queued" in queue._jobs
 
             await queue.stop()

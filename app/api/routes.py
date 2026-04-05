@@ -13,7 +13,7 @@ from app.models.call_log import (
 )
 from app.services.elasticsearch_service import es_service
 from app.services.embedding_service import embedding_service
-from app.services.ingest_queue import ingest_queue
+from app.services.ingest_queue import ingest_queue, QueueFullError
 
 router = APIRouter()
 
@@ -74,10 +74,12 @@ async def create_call_log(payload: CallLogCreate):
 async def submit_ingest(req: IngestRequest):
     """
     Submit a call for async processing.
-    Returns immediately with a job_id. The service calls the STT API in the
-    background with concurrency control, then embeds and stores the result.
+    Returns immediately with a job_id. Returns 429 if the queue is full.
     """
-    job = await ingest_queue.submit(req)
+    try:
+        job = ingest_queue.submit(req)
+    except QueueFullError as exc:
+        raise HTTPException(status_code=429, detail=str(exc))
     return IngestJobResponse(
         job_id=job.job_id,
         call_id=job.call_id,
