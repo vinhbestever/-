@@ -35,34 +35,14 @@ class Speaker(BaseModel):
 
 
 class Utterance(BaseModel):
-    """A single turn in the conversation, already segmented by the STT API."""
+    """A single turn in the conversation, segmented by the STT API."""
     speaker: str
     text: str
     start_time: Optional[float] = None
     end_time: Optional[float] = None
 
 
-# ── Direct ingest (utterances already available) ──────────────
-
-
-class CallLogCreate(BaseModel):
-    """Payload when utterances are already available from the STT API."""
-    call_id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
-    direction: CallDirection = CallDirection.INBOUND
-    status: CallStatus = CallStatus.COMPLETED
-    speaker_a: Optional[Speaker] = None
-    speaker_b: Optional[Speaker] = None
-    utterances: list[Utterance] = Field(..., min_length=1)
-    call_start_time: Optional[datetime] = None
-    call_end_time: Optional[datetime] = None
-    duration_seconds: Optional[float] = None
-    language: str = "vi"
-    source_system: Optional[str] = None
-    tags: list[str] = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
-
-
-# ── Async ingest (service calls STT in background) ───────────
+# ── Ingest request ────────────────────────────────────────────
 
 
 class IngestRequest(BaseModel):

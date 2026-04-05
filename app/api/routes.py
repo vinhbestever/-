@@ -2,8 +2,6 @@ import asyncio
 from fastapi import APIRouter, HTTPException, Query
 
 from app.models.call_log import (
-    CallLogCreate,
-    CallLogDocument,
     CallLogResponse,
     IngestRequest,
     IngestJobResponse,
@@ -24,56 +22,7 @@ async def _embed_async(text: str) -> list[float]:
     return await loop.run_in_executor(None, embedding_service.embed, text)
 
 
-# ── Direct ingest (utterances already available) ──────────────
-
-
-@router.post("/call-logs", response_model=CallLogResponse, status_code=201)
-async def create_call_log(payload: CallLogCreate):
-    """Store a call log. Utterances come pre-segmented from the STT API."""
-    full_text = "\n".join(
-        f"{u.speaker}: {u.text}" for u in payload.utterances
-    )
-
-    vector = await _embed_async(full_text)
-
-    doc = CallLogDocument(
-        call_id=payload.call_id,
-        direction=payload.direction,
-        status=payload.status,
-        speaker_a=payload.speaker_a,
-        speaker_b=payload.speaker_b,
-        utterances=payload.utterances,
-        full_text=full_text,
-        call_start_time=payload.call_start_time,
-        call_end_time=payload.call_end_time,
-        duration_seconds=payload.duration_seconds,
-        language=payload.language,
-        source_system=payload.source_system,
-        tags=payload.tags,
-        metadata=payload.metadata,
-        embedding=vector,
-    )
-
-    await es_service.index_call_log(doc)
-
-    return CallLogResponse(
-        call_id=doc.call_id,
-        direction=doc.direction,
-        status=doc.status,
-        speaker_a=doc.speaker_a,
-        speaker_b=doc.speaker_b,
-        utterances=doc.utterances,
-        full_text=doc.full_text,
-        call_start_time=doc.call_start_time,
-        call_end_time=doc.call_end_time,
-        duration_seconds=doc.duration_seconds,
-        language=doc.language,
-        tags=doc.tags,
-        indexed_at=doc.indexed_at,
-    )
-
-
-# ── Async ingest (submit audio → background STT → embed → store) ─
+# ── Ingest (submit audio → background STT → embed → store) ───
 
 
 @router.post("/ingest", response_model=IngestJobResponse, status_code=202)

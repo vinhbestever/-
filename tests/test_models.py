@@ -1,45 +1,35 @@
 import pytest
 from pydantic import ValidationError
 from app.models.call_log import (
-    CallLogCreate,
+    IngestRequest,
     CallDirection,
-    CallStatus,
     Speaker,
-    Utterance,
     SemanticSearchRequest,
 )
 
 
-class TestCallLogCreate:
+class TestIngestRequest:
     def test_valid_minimal(self):
-        log = CallLogCreate(
-            utterances=[Utterance(speaker="A", text="Xin chào")]
-        )
-        assert log.call_id is not None
-        assert log.direction == CallDirection.INBOUND
-        assert len(log.utterances) == 1
+        req = IngestRequest(audio_url="https://example.com/call.wav")
+        assert req.call_id is not None
+        assert req.audio_url == "https://example.com/call.wav"
+        assert req.direction == CallDirection.INBOUND
 
     def test_valid_full(self):
-        log = CallLogCreate(
+        req = IngestRequest(
+            audio_url="https://example.com/call.wav",
             direction=CallDirection.OUTBOUND,
-            status=CallStatus.COMPLETED,
             speaker_a=Speaker(name="Agent", phone_number="0901234567", role="agent"),
             speaker_b=Speaker(name="Customer", phone_number="0987654321", role="customer"),
-            utterances=[
-                Utterance(speaker="Agent", text="Xin chào anh", start_time=0.0, end_time=1.5),
-                Utterance(speaker="Customer", text="Chào bạn", start_time=1.6, end_time=2.8),
-            ],
             language="vi",
             tags=["support", "vip"],
         )
-        assert log.speaker_a.name == "Agent"
-        assert log.language == "vi"
-        assert len(log.utterances) == 2
-        assert len(log.tags) == 2
+        assert req.speaker_a.name == "Agent"
+        assert len(req.tags) == 2
 
-    def test_empty_utterances_rejected(self):
+    def test_empty_audio_url_rejected(self):
         with pytest.raises(ValidationError):
-            CallLogCreate(utterances=[])
+            IngestRequest(audio_url="")
 
 
 class TestSemanticSearchRequest:
