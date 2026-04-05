@@ -4,7 +4,7 @@ from typing import Optional
 
 class Settings(BaseSettings):
     app_name: str = "call-log-service"
-    app_version: str = "1.0.0"
+    app_version: str = "2.0.0"
     debug: bool = False
 
     # Elasticsearch
@@ -12,20 +12,12 @@ class Settings(BaseSettings):
     elasticsearch_username: Optional[str] = None
     elasticsearch_password: Optional[str] = None
     elasticsearch_call_log_index: str = "call-logs"
-    elasticsearch_call_log_enriched_index: str = "call-logs-enriched"
     elasticsearch_max_retries: int = 3
     elasticsearch_retry_on_timeout: bool = True
 
-    # Kafka
-    kafka_bootstrap_servers: str = "localhost:9092"
-    kafka_topic_raw: str = "call-logs-raw"
-    kafka_topic_enriched: str = "call-logs-enriched"
-    kafka_consumer_group: str = "call-log-enrichment-group"
-    kafka_auto_offset_reset: str = "earliest"
-
-    # NLP / Enrichment
-    spacy_model: str = "en_core_web_sm"
-    enrichment_enabled: bool = True
+    # Embedding
+    embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+    embedding_dims: int = 384
 
     # API
     api_host: str = "0.0.0.0"

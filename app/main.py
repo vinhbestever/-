@@ -5,7 +5,7 @@ from fastapi import FastAPI
 from app.config import settings
 from app.api.routes import router
 from app.services.elasticsearch_service import es_service
-from app.services.kafka_service import kafka_producer
+from app.services.embedding_service import embedding_service
 
 structlog.configure(
     processors=[
@@ -22,22 +22,15 @@ structlog.configure(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await es_service.ensure_index()
-    try:
-        await kafka_producer.start()
-    except Exception:
-        structlog.get_logger().warning("Kafka not available — running without message queue")
+    dims = embedding_service.dims
+    await es_service.ensure_index(dims)
     yield
-    try:
-        await kafka_producer.stop()
-    except Exception:
-        pass
     await es_service.close()
 
 
 app = FastAPI(
     title="Call Log Service",
-    description="Data flow service for logging, enriching, and intelligently querying call transcriptions",
+    description="Store call transcriptions and search by semantic meaning",
     version=settings.app_version,
     lifespan=lifespan,
 )

@@ -1,171 +1,112 @@
-# Kiến trúc chi tiết — Call Log Service
+# Kiến trúc chi tiết — Call Log Service v2
 
-## 1. Tổng quan thiết kế
+## Thiết kế
 
-Service được thiết kế theo mô hình **Event-Driven Architecture** với nguyên tắc:
+Service đơn giản hóa thành 3 bước: **Store → Embed → Search**.
 
-- **Log-first**: Mọi transcript được index vào Elasticsearch ngay lập tức, đảm bảo không mất dữ liệu
-- **Async enrichment**: Xử lý NLP/trích xuất thông tin chạy bất đồng bộ qua Kafka, không block API response
-- **Smart retrieval**: Tìm kiếm kết hợp full-text, exact match, fuzzy match, và aggregation
+Giả định: STT API đã trả về cuộc hội thoại phân chia sẵn giữa 2 người nói (speaker diarization done upstream).
 
-## 2. Lựa chọn Tech Stack
-
-### 2.1 Tại sao Kafka?
-
-**Vấn đề cần giải quyết:**
-- Đảm bảo log 100% cuộc gọi (không mất message)
-- Tách biệt ingestion (nhanh) với enrichment (chậm hơn)
-- Có thể replay lại message nếu enrichment pipeline thay đổi
-
-**Kafka mang lại:**
-- **Durability**: Message được persist trên disk, configurable retention
-- **Replay**: Consumer có thể seek về offset cũ để xử lý lại
-- **Scalability**: Thêm partition + consumer để scale horizontal
-- **Decoupling**: API server và enrichment worker hoàn toàn độc lập
-
-**Alternatives đã xem xét:**
-- RabbitMQ: Tốt cho task queue nhưng không có replay built-in
-- Redis Streams: Nhẹ hơn nhưng kém durability hơn Kafka
-- AWS SQS/SNS: Lock-in cloud, không self-hosted
-
-### 2.2 Tại sao Elasticsearch?
-
-- Đã có sẵn hạ tầng (yêu cầu của bạn)
-- Full-text search mạnh với nhiều analyzer
-- Aggregation engine mạnh cho analytics
-- Vietnamese text search với custom analyzer (asciifolding cho dấu)
-- Nested queries cho transcript segments
-- Horizontal scaling với sharding
-
-### 2.3 Tại sao FastAPI?
-
-- Async/await native — phù hợp với Elasticsearch async client và Kafka
-- Auto-generate OpenAPI/Swagger docs
-- Pydantic validation — type-safe request/response
-- Hiệu năng cao so với Flask/Django cho I/O-bound workload
-
-### 2.4 Tại sao spaCy + Regex?
-
-- spaCy: NER (Named Entity Recognition) nhanh, production-ready
-- Regex: Pattern matching chính xác cho SĐT Việt Nam, số tiền VNĐ, ngày tháng VN
-- Không cần GPU, chạy được trên CPU
-- Dễ mở rộng sang Vietnamese model (PhoBERT) sau này
-
-## 3. Chi tiết Elasticsearch Mapping
-
-### Index Design
-
-Sử dụng **single index** `call-logs` với mapping tối ưu:
+## Data Flow
 
 ```
-call-logs/
-├── call_id          (keyword)     — ID duy nhất
-├── transcript_text  (text)        — Full-text search
-│   ├── .vietnamese  (text)        — Vietnamese analyzer
-│   └── .keyword     (keyword)     — Exact match
-├── transcript_segments (nested)   — Chi tiết từng đoạn
-├── caller/callee    (object)      — Thông tin người gọi
-├── enriched/        (object)      — Dữ liệu enrichment
-│   ├── summary      (text)
-│   ├── keywords     (keyword)
-│   ├── entities     (nested)
-│   ├── sentiment    (keyword)
-│   ├── topics       (keyword)
-│   └── action_items (text)
-├── call_start_time  (date)
-├── duration_seconds (float)
-└── indexed_at       (date)
+STT API response:
+  utterances: [
+    {speaker: "Agent",    text: "Xin chào..."},
+    {speaker: "Customer", text: "Tôi muốn..."},
+    ...
+  ]
+      │
+      ▼
+Call Log API (POST /call-logs):
+  1. Ghép utterances → full_text
+  2. Embed full_text → vector [384 dims]
+  3. Index {utterances, full_text, vector} → Elasticsearch
+      │
+      ▼
+Elasticsearch document:
+  - utterances[]   (nested, searchable per turn)
+  - full_text      (text, BM25 searchable)
+  - embedding      (dense_vector, kNN indexed)
+      │
+      ▼
+Search:
+  - /search/semantic → kNN cosine trên embedding
+  - /search/hybrid   → kNN + BM25 combined score
 ```
 
-### Custom Analyzers
+## Elasticsearch Mapping
 
-- **transcript_analyzer**: `standard` tokenizer + `lowercase` + `asciifolding` + `trim`
-- **vietnamese_analyzer**: `standard` tokenizer + `lowercase` + `asciifolding`
+### dense_vector field
 
-`asciifolding` rất quan trọng cho tiếng Việt — cho phép tìm "khieu nai" match "khiếu nại".
-
-## 4. Luồng Enrichment chi tiết
-
-```
-Raw transcript text
-        │
-        ├─▶ Phone number extraction (regex)
-        │     VN patterns: 0xxx, +84xxx
-        │
-        ├─▶ Amount extraction (regex)
-        │     Patterns: xxx đồng, xxx VND, $xxx
-        │
-        ├─▶ Date extraction (regex)
-        │     Patterns: dd/mm/yyyy, "ngày X tháng Y"
-        │
-        ├─▶ Entity extraction (spaCy NER)
-        │     PERSON, ORG, GPE, MONEY, DATE
-        │
-        ├─▶ Keyword extraction (spaCy noun chunks / frequency)
-        │
-        ├─▶ Action item extraction (keyword matching)
-        │     "cần", "phải", "sẽ", "gọi lại"...
-        │
-        ├─▶ Sentiment analysis (lexicon-based)
-        │     positive / negative / neutral
-        │
-        ├─▶ Topic classification (keyword mapping)
-        │     payment, support, complaint, order...
-        │
-        └─▶ Summary generation (extractive: top 3 sentences)
+```json
+{
+  "embedding": {
+    "type": "dense_vector",
+    "dims": 384,
+    "index": true,
+    "similarity": "cosine"
+  }
+}
 ```
 
-## 5. Search Strategy — "Tìm kiếm thông minh"
+- `index: true` bật HNSW graph cho approximate kNN
+- `similarity: cosine` phù hợp với normalized embeddings
+- 384 dims từ paraphrase-multilingual-MiniLM-L12-v2
 
-### Smart Search (`/smart-search`)
+### Utterances as nested
 
-Kết hợp nhiều chiến lược trong một query:
+```json
+{
+  "utterances": {
+    "type": "nested",
+    "properties": {
+      "speaker": {"type": "keyword"},
+      "text": {"type": "text", "analyzer": "vn_analyzer"}
+    }
+  }
+}
+```
 
-1. **Multi-match** (fuzzy): Tìm trên transcript, summary, keywords, topics, tên người
-2. **Phrase match** (boost 5x): Ưu tiên kết quả chứa exact phrase
-3. **Term match** (boost 10x): Nếu input là SĐT, match chính xác caller/callee
-4. **Highlighting**: Đánh dấu vị trí match trong transcript
-5. **Aggregations**: Kèm thống kê by direction, status, sentiment, keywords
+Cho phép query chính xác "Agent nói gì" hoặc "Customer nói gì" nếu cần.
 
-### Advanced Search (`/search`)
+## Embedding Model
 
-Structured query với:
-- Full-text search (`q`)
-- Exact filters (direction, status, caller_phone, language...)
-- Range filters (date_from/to, duration_min/max)
-- Tag/keyword matching
-- Pagination & sorting
+**`paraphrase-multilingual-MiniLM-L12-v2`** được chọn vì:
 
-## 6. Scaling & Production Considerations
+- Hỗ trợ tiếng Việt native (trained trên 50+ ngôn ngữ)
+- 384 dims — tiết kiệm storage so với 768 dims
+- Nhanh: ~5ms/sentence trên CPU
+- Normalize sẵn → cosine similarity = dot product
 
-### Elasticsearch
-- **ILM Policy**: Hot (7 ngày) → Warm (30 ngày) → Cold (90 ngày) → Delete
-- **Shard sizing**: Target 20-40GB/shard
-- **Replica**: Minimum 1 replica cho HA
+Nếu cần chất lượng cao hơn, đổi sang:
+- `dangvantuan/vietnamese-embedding` (768 dims, optimized cho tiếng Việt)
+- `intfloat/multilingual-e5-large` (1024 dims, SOTA multilingual)
 
-### Kafka
-- **Partitions**: 6-12 partitions cho `call-logs-raw` topic
-- **Retention**: 7 ngày minimum cho replay capability
-- **Consumer group**: Scale enrichment workers horizontal
+## Search Strategy
 
-### API
-- **Horizontal scaling**: Stateless, chạy nhiều instances sau load balancer
-- **Rate limiting**: Thêm middleware nếu expose public
+### Semantic Search (pure kNN)
 
-## 7. Monitoring
+Tìm cuộc gọi **gần nghĩa nhất** với query:
 
-- **Health check**: `/health` endpoint check ES connectivity
-- **Kafka lag**: Monitor consumer group lag
-- **ES cluster health**: Via Kibana hoặc `_cluster/health`
-- Có thể thêm Prometheus metrics (đã include `prometheus-client` trong dependencies)
+```
+Query: "khách hàng không hài lòng về sản phẩm"
+  → embed → vector
+  → kNN top-k cosine similarity
+  → trả về cuộc gọi có nội dung tương tự về nghĩa
+```
 
-## 8. Roadmap mở rộng
+Phù hợp khi query mang tính mô tả, diễn đạt khác nhưng cùng ý.
 
-| Ưu tiên | Feature | Mô tả |
-|---------|---------|-------|
-| P1 | Vietnamese NLP | Thay spaCy bằng PhoBERT/VnCoreNLP |
-| P1 | LLM Summarization | Dùng GPT/Claude cho tóm tắt chất lượng |
-| P2 | Vector Search | Elasticsearch kNN cho semantic search |
-| P2 | Real-time alerts | Cảnh báo khi sentiment < threshold |
-| P3 | Audio storage | S3 integration cho file gốc |
-| P3 | Dashboard | Kibana dashboards cho analytics |
+### Hybrid Search (kNN + BM25)
+
+Kết hợp 2 signal:
+- **kNN score**: Ngữ nghĩa giống nhau
+- **BM25 score**: Từ khóa khớp chính xác
+
+Elasticsearch tự combine scores. Hybrid thường cho kết quả tốt nhất khi query vừa có ý nghĩa ngữ nghĩa vừa chứa từ khóa cụ thể.
+
+## Scaling
+
+- **Embedding**: Stateless, có thể chạy nhiều API instances
+- **Elasticsearch**: Horizontal scaling qua sharding
+- **Model loading**: Lazy load, chỉ load 1 lần khi startup

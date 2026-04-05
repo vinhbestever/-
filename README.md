@@ -1,174 +1,126 @@
-# Call Log Service — Data Flow cho Log cuộc gọi
+# Call Log Service — Lưu & Semantic Search cuộc gọi
 
-Service ghi log và trích xuất thông tin thông minh từ text cuộc gọi (speech-to-text), xây dựng trên **FastAPI + Kafka + Elasticsearch**.
+Service nhận transcript cuộc gọi (đã phân chia speaker từ STT API), lưu vào Elasticsearch kèm embedding vector, và hỗ trợ tìm kiếm theo ngữ nghĩa (semantic search).
 
-## Kiến trúc tổng quan
+## Kiến trúc
 
 ```
-┌──────────────────┐
-│  Speech-to-Text  │  (API đã có sẵn)
-│       API        │
-└────────┬─────────┘
-         │ transcript text
-         ▼
-┌──────────────────┐     ┌─────────────────────┐
-│   Call Log API   │────▶│       Kafka          │
-│    (FastAPI)     │     │  topic: call-logs-raw│
-└────────┬─────────┘     └──────────┬───────────┘
-         │                          │
-         │ index ngay               │ async consume
-         ▼                          ▼
-┌──────────────────┐     ┌─────────────────────┐
-│  Elasticsearch   │◀────│  Enrichment Worker  │
-│   (call-logs)    │     │  (NLP / Regex)      │
-└────────┬─────────┘     └──────────┬───────────┘
-         │                          │
-         │                          ▼
-         │               ┌─────────────────────┐
-         │               │       Kafka          │
-         │               │topic: call-logs-     │
-         │               │       enriched       │
-         │               └─────────────────────┘
-         ▼
-┌──────────────────┐
-│  Search / Query  │
-│  Smart Search    │
-│  Analytics API   │
-└──────────────────┘
+┌───────────────────┐
+│  Speech-to-Text   │  (API đã có sẵn, trả về utterances phân chia 2 người)
+│       API         │
+└─────────┬─────────┘
+          │ utterances[]
+          ▼
+┌───────────────────┐      ┌───────────────────────┐
+│  Call Log API     │─────▶│  Embedding Model      │
+│  (FastAPI)        │      │  (sentence-transformers│
+└─────────┬─────────┘      │   multilingual)       │
+          │                └───────────────────────┘
+          │ doc + vector
+          ▼
+┌───────────────────┐
+│  Elasticsearch    │
+│  (dense_vector    │
+│   + full_text)    │
+└─────────┬─────────┘
+          │
+          ▼
+┌───────────────────┐
+│  Semantic Search  │  kNN cosine similarity
+│  Hybrid Search    │  kNN + BM25 full-text
+└───────────────────┘
 ```
 
-## Luồng dữ liệu (Data Flow)
+## Luồng dữ liệu
 
-### 1. Ingestion (Thu thập)
-- API nhận transcript text từ hệ thống speech-to-text
-- Dữ liệu được **index ngay lập tức** vào Elasticsearch (đảm bảo log 100%)
-- Đồng thời publish message lên Kafka topic `call-logs-raw`
-
-### 2. Enrichment (Làm giàu dữ liệu)
-Worker tiêu thụ từ Kafka và tự động trích xuất:
-- **Tóm tắt** nội dung cuộc gọi
-- **Keywords** quan trọng
-- **Entities**: tên người, tổ chức, địa điểm
-- **Số điện thoại** được nhắc đến trong cuộc gọi
-- **Ngày tháng** được đề cập
-- **Số tiền** được đề cập
-- **Sentiment**: tích cực / tiêu cực / trung lập
-- **Topics**: thanh toán, hỗ trợ, khiếu nại, đặt hàng...
-- **Action items**: các việc cần làm sau cuộc gọi
-
-### 3. Search & Query (Tìm kiếm thông minh)
-- **Full-text search** với fuzzy matching cho tiếng Việt
-- **Smart search**: tự động match transcript, số điện thoại, keywords, topics
-- **Phrase search** với boost cao cho exact match
-- **Filters**: theo hướng gọi, trạng thái, thời gian, sentiment...
-- **Aggregations**: thống kê tổng hợp theo nhiều chiều
-
-## Tech Stack
-
-| Component | Technology | Lý do chọn |
-|-----------|-----------|-------------|
-| **API** | FastAPI (Python) | Async native, tự generate OpenAPI docs, hiệu năng cao |
-| **Message Queue** | Apache Kafka | Đảm bảo không mất log, replay được, scale horizontal |
-| **Storage & Search** | Elasticsearch | Full-text search mạnh, aggregation, đã có sẵn hạ tầng |
-| **NLP** | spaCy + Regex | NER, keyword extraction; regex cho SĐT/tiền/ngày VN |
-| **Visualization** | Kibana | Dashboard có sẵn với Elasticsearch |
+1. **STT API** trả về danh sách `utterances` — mỗi utterance gồm `speaker` + `text`, đã phân chia sẵn giữa 2 người nói
+2. **Call Log API** nhận utterances, ghép thành `full_text`, chạy qua embedding model → vector 384 chiều
+3. **Elasticsearch** lưu document gồm: utterances gốc, full_text, và embedding vector (`dense_vector` + HNSW index)
+4. **Search** — 2 chế độ:
+   - **Semantic search**: Embed query → kNN tìm cuộc gọi gần nhất về ngữ nghĩa
+   - **Hybrid search**: Kết hợp kNN + BM25 full-text để tăng độ chính xác
 
 ## API Endpoints
 
 | Method | Endpoint | Mô tả |
 |--------|----------|-------|
-| `POST` | `/api/v1/call-logs` | Tạo mới call log |
-| `GET` | `/api/v1/call-logs/{call_id}` | Lấy call log theo ID |
-| `POST` | `/api/v1/call-logs/search` | Tìm kiếm nâng cao với filters |
-| `GET` | `/api/v1/call-logs/smart-search/?q=...` | Tìm kiếm thông minh |
-| `GET` | `/api/v1/analytics` | Thống kê tổng hợp |
-| `POST` | `/api/v1/call-logs/{call_id}/re-enrich` | Chạy lại enrichment |
-| `GET` | `/health` | Health check |
+| `POST` | `/api/v1/call-logs` | Lưu call log mới |
+| `GET`  | `/api/v1/call-logs` | Liệt kê call logs |
+| `GET`  | `/api/v1/call-logs/{call_id}` | Lấy chi tiết |
+| `POST` | `/api/v1/search/semantic` | Tìm kiếm theo ngữ nghĩa |
+| `POST` | `/api/v1/search/hybrid` | Tìm kiếm kết hợp (semantic + full-text) |
+| `GET`  | `/health` | Health check |
 
 ## Cài đặt & Chạy
 
-### Docker Compose (khuyên dùng)
+### Docker Compose
 
 ```bash
 docker compose up -d
 ```
 
-Bao gồm: Elasticsearch, Kibana, Kafka, API, và Enrichment Worker.
-
-### Chạy local (development)
+### Local development
 
 ```bash
-# Cài dependencies
 pip install -r requirements.txt
-
-# (Tuỳ chọn) Cài spaCy model cho NER
-python -m spacy download en_core_web_sm
-
-# Chạy API
 uvicorn app.main:app --reload --port 8000
-
-# Chạy enrichment worker (terminal khác)
-python -m app.workers.enrichment_worker
 ```
 
 ### Nếu đã có Elasticsearch sẵn
 
-Chỉ cần cấu hình biến môi trường:
-
 ```bash
 export CALLLOG_ELASTICSEARCH_HOSTS=http://your-es-host:9200
-export CALLLOG_ELASTICSEARCH_USERNAME=your_user     # nếu cần
-export CALLLOG_ELASTICSEARCH_PASSWORD=your_password  # nếu cần
+uvicorn app.main:app --reload
 ```
 
 ## Ví dụ sử dụng
 
-### Tạo call log
+### Lưu call log
 
 ```bash
 curl -X POST http://localhost:8000/api/v1/call-logs \
   -H "Content-Type: application/json" \
   -d '{
-    "transcript_text": "Xin chào, tôi là Nguyễn Văn A, SĐT 0912345678. Tôi muốn khiếu nại về đơn hàng ngày 15/03/2026. Tổng tiền 500.000 đồng nhưng hàng bị hỏng. Bạn cần kiểm tra và gọi lại cho tôi.",
+    "utterances": [
+      {"speaker": "Agent", "text": "Xin chào anh, em có thể giúp gì ạ?"},
+      {"speaker": "Customer", "text": "Anh muốn khiếu nại đơn hàng bị hỏng"},
+      {"speaker": "Agent", "text": "Dạ em xin lỗi, em chuyển bộ phận xử lý ngay ạ"}
+    ],
     "direction": "inbound",
-    "status": "completed",
-    "caller": {
-      "name": "Nguyễn Văn A",
-      "phone_number": "0912345678",
-      "role": "customer"
-    },
-    "callee": {
-      "name": "Hotline CSKH",
-      "phone_number": "19001234",
-      "role": "agent"
-    },
-    "language": "vi",
-    "tags": ["complaint", "vip"],
-    "duration_seconds": 180
+    "speaker_a": {"name": "Agent Lan", "role": "agent"},
+    "speaker_b": {"name": "Khách hàng", "role": "customer"},
+    "tags": ["complaint"]
   }'
 ```
 
-### Tìm kiếm thông minh
+### Semantic search
 
 ```bash
-curl "http://localhost:8000/api/v1/call-logs/smart-search/?q=khiếu nại đơn hàng"
+curl -X POST http://localhost:8000/api/v1/search/semantic \
+  -H "Content-Type: application/json" \
+  -d '{"query": "khách hàng phàn nàn sản phẩm hỏng"}'
 ```
 
-### Tìm kiếm nâng cao
+### Hybrid search (semantic + full-text)
 
 ```bash
-curl -X POST http://localhost:8000/api/v1/call-logs/search \
+curl -X POST http://localhost:8000/api/v1/search/hybrid \
   -H "Content-Type: application/json" \
   -d '{
-    "q": "khiếu nại",
+    "query": "thanh toán hóa đơn",
     "direction": "inbound",
-    "sentiment": "negative",
-    "date_from": "2026-01-01T00:00:00",
-    "tags": ["complaint"],
-    "page": 1,
-    "size": 20
+    "size": 10
   }'
 ```
+
+## Embedding Model
+
+Mặc định dùng `paraphrase-multilingual-MiniLM-L12-v2`:
+- Hỗ trợ 50+ ngôn ngữ bao gồm **tiếng Việt**
+- Vector 384 chiều — nhẹ, nhanh
+- Cosine similarity cho semantic matching
+
+Có thể đổi sang model khác qua biến môi trường `CALLLOG_EMBEDDING_MODEL`.
 
 ## Chạy tests
 
@@ -182,32 +134,19 @@ pytest tests/ -v
 ```
 ├── app/
 │   ├── api/
-│   │   └── routes.py            # API endpoints
+│   │   └── routes.py                  # API endpoints
 │   ├── models/
-│   │   └── call_log.py          # Pydantic models
+│   │   └── call_log.py                # Pydantic models
 │   ├── services/
-│   │   ├── elasticsearch_service.py  # ES indexing & search
-│   │   ├── kafka_service.py          # Kafka producer/consumer
-│   │   └── enrichment_service.py     # NLP enrichment pipeline
-│   ├── workers/
-│   │   └── enrichment_worker.py      # Async Kafka consumer worker
-│   ├── utils/
-│   ├── config.py                # Settings via env vars
-│   └── main.py                  # FastAPI app entry point
+│   │   ├── elasticsearch_service.py   # ES indexing + kNN/hybrid search
+│   │   └── embedding_service.py       # sentence-transformers wrapper
+│   ├── config.py
+│   └── main.py
 ├── tests/
-├── docs/
-│   └── ARCHITECTURE.md          # Chi tiết kiến trúc
+├── scripts/
+│   └── create_sample_data.py
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
 └── .env.example
 ```
-
-## Mở rộng trong tương lai
-
-- **Vector search**: Dùng Elasticsearch kNN để tìm cuộc gọi tương tự về ngữ nghĩa
-- **LLM summarization**: Tích hợp OpenAI/local LLM để tóm tắt chất lượng hơn
-- **Vietnamese NLP model**: Thay spaCy bằng PhoBERT/VnCoreNLP cho NER tiếng Việt
-- **Real-time streaming**: WebSocket push khi có cuộc gọi mới
-- **Alerting**: Tự động cảnh báo khi phát hiện sentiment tiêu cực
-- **ILM (Index Lifecycle Management)**: Hot/warm/cold cho Elasticsearch

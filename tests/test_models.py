@@ -4,52 +4,61 @@ from app.models.call_log import (
     CallLogCreate,
     CallDirection,
     CallStatus,
-    Participant,
-    SearchQuery,
+    Speaker,
+    Utterance,
+    SemanticSearchRequest,
 )
 
 
 class TestCallLogCreate:
     def test_valid_minimal(self):
-        log = CallLogCreate(transcript_text="Hello world")
+        log = CallLogCreate(
+            utterances=[Utterance(speaker="A", text="Xin chào")]
+        )
         assert log.call_id is not None
         assert log.direction == CallDirection.INBOUND
-        assert log.transcript_text == "Hello world"
+        assert len(log.utterances) == 1
 
     def test_valid_full(self):
         log = CallLogCreate(
             direction=CallDirection.OUTBOUND,
             status=CallStatus.COMPLETED,
-            caller=Participant(name="Agent", phone_number="0901234567", role="agent"),
-            callee=Participant(name="Customer", phone_number="0987654321", role="customer"),
-            transcript_text="Xin chào, tôi muốn hỏi về dịch vụ",
+            speaker_a=Speaker(name="Agent", phone_number="0901234567", role="agent"),
+            speaker_b=Speaker(name="Customer", phone_number="0987654321", role="customer"),
+            utterances=[
+                Utterance(speaker="Agent", text="Xin chào anh", start_time=0.0, end_time=1.5),
+                Utterance(speaker="Customer", text="Chào bạn", start_time=1.6, end_time=2.8),
+            ],
             language="vi",
             tags=["support", "vip"],
         )
-        assert log.caller.name == "Agent"
+        assert log.speaker_a.name == "Agent"
         assert log.language == "vi"
+        assert len(log.utterances) == 2
         assert len(log.tags) == 2
 
-    def test_empty_transcript_rejected(self):
+    def test_empty_utterances_rejected(self):
         with pytest.raises(ValidationError):
-            CallLogCreate(transcript_text="")
+            CallLogCreate(utterances=[])
 
 
-class TestSearchQuery:
+class TestSemanticSearchRequest:
     def test_defaults(self):
-        q = SearchQuery()
-        assert q.page == 1
-        assert q.size == 20
-        assert q.sort_by == "indexed_at"
+        req = SemanticSearchRequest(query="tìm cuộc gọi khiếu nại")
+        assert req.size == 20
+        assert req.min_score is None
+        assert req.direction is None
 
-    def test_custom_values(self):
-        q = SearchQuery(
-            q="khiếu nại",
+    def test_with_filters(self):
+        req = SemanticSearchRequest(
+            query="thanh toán",
+            size=10,
             direction=CallDirection.INBOUND,
-            tags=["vip"],
-            page=2,
-            size=50,
+            tags=["payment"],
         )
-        assert q.q == "khiếu nại"
-        assert q.direction == CallDirection.INBOUND
-        assert q.page == 2
+        assert req.size == 10
+        assert req.direction == CallDirection.INBOUND
+
+    def test_empty_query_rejected(self):
+        with pytest.raises(ValidationError):
+            SemanticSearchRequest(query="")
