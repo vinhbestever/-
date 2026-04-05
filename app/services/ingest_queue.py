@@ -1,4 +1,5 @@
 import asyncio
+import time
 import structlog
 from datetime import datetime, timezone
 from typing import Optional
@@ -13,10 +14,16 @@ from app.models.call_log import (
 from app.services.stt_client import stt_client
 from app.services.embedding_service import embedding_service
 from app.services.elasticsearch_service import es_service
+from app.middleware import (
+    INGEST_QUEUE_DEPTH,
+    INGEST_JOBS_TOTAL,
+    STT_CALL_DURATION,
+    EMBED_DURATION,
+)
 
 logger = structlog.get_logger(__name__)
 
-_JOB_TTL_SECONDS = 3600  # auto-purge completed/failed jobs after 1 hour
+_JOB_TTL_SECONDS = 3600
 
 
 class IngestQueue:
@@ -28,6 +35,7 @@ class IngestQueue:
     - asyncio.Semaphore to cap concurrent STT API calls
     - run_in_executor for CPU-bound embedding (avoids blocking the event loop)
     - TTL-based auto-cleanup of finished jobs to prevent memory leak
+    - Graceful shutdown: waits for in-flight jobs to finish before stopping
     """
 
     def __init__(self):
@@ -37,6 +45,7 @@ class IngestQueue:
         self._semaphore: asyncio.Semaphore | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._running = False
+        self._in_flight = 0
 
     @property
     def jobs(self) -> dict[str, IngestJobDetail]:
@@ -66,6 +75,13 @@ class IngestQueue:
 
     async def stop(self):
         self._running = False
+
+        # Drain: wait for in-flight jobs to finish (up to 30s)
+        for _ in range(300):
+            if self._in_flight == 0 and self.pending_count == 0:
+                break
+            await asyncio.sleep(0.1)
+
         if self._cleanup_task:
             self._cleanup_task.cancel()
         for worker in self._workers:
@@ -75,7 +91,7 @@ class IngestQueue:
         self._workers.clear()
         self._cleanup_task = None
         await stt_client.close()
-        logger.info("Ingest queue stopped")
+        logger.info("Ingest queue stopped", drained_ok=self._in_flight == 0)
 
     def submit(self, req: IngestRequest) -> IngestJobDetail:
         """
@@ -99,6 +115,7 @@ class IngestQueue:
 
         self._jobs[job.job_id] = job
         job.queue_position = self._queue.qsize()
+        INGEST_QUEUE_DEPTH.set(self._queue.qsize())
 
         logger.info("Job queued", job_id=job.job_id, queue_size=self._queue.qsize())
         return job
@@ -118,26 +135,36 @@ class IngestQueue:
             except asyncio.CancelledError:
                 break
 
+            self._in_flight += 1
+            INGEST_QUEUE_DEPTH.set(self._queue.qsize())
             try:
                 await self._process_job(job_id, req)
             except Exception:
                 logger.exception("Unhandled error in worker", worker_id=worker_id, job_id=job_id)
             finally:
+                self._in_flight -= 1
                 self._queue.task_done()
 
     async def _process_job(self, job_id: str, req: IngestRequest):
         job = self._jobs[job_id]
 
         try:
+            # Step 1: Call STT API (rate-limited by semaphore)
             job.status = JobStatus.CALLING_STT
+            t0 = time.perf_counter()
             async with self._semaphore:
                 utterances = await stt_client.transcribe(req.audio_url, req.language)
+            STT_CALL_DURATION.observe(time.perf_counter() - t0)
 
+            # Step 2: Embed in thread pool
             job.status = JobStatus.EMBEDDING
             full_text = "\n".join(f"{u.speaker}: {u.text}" for u in utterances)
+            t0 = time.perf_counter()
             loop = asyncio.get_running_loop()
             vector = await loop.run_in_executor(None, embedding_service.embed, full_text)
+            EMBED_DURATION.observe(time.perf_counter() - t0)
 
+            # Step 3: Index into Elasticsearch
             job.status = JobStatus.INDEXING
             doc = CallLogDocument(
                 call_id=req.call_id,
@@ -160,18 +187,19 @@ class IngestQueue:
 
             job.status = JobStatus.DONE
             job.completed_at = datetime.now(timezone.utc)
+            INGEST_JOBS_TOTAL.labels(status="done").inc()
             logger.info("Job completed", job_id=job_id, call_id=req.call_id)
 
         except Exception as exc:
             job.status = JobStatus.FAILED
             job.error = str(exc)
             job.completed_at = datetime.now(timezone.utc)
+            INGEST_JOBS_TOTAL.labels(status="failed").inc()
             logger.error("Job failed", job_id=job_id, error=str(exc))
 
     # ── Cleanup ───────────────────────────────────────────────
 
     async def _cleanup_loop(self):
-        """Periodically remove finished jobs older than TTL to prevent memory leak."""
         while self._running:
             try:
                 await asyncio.sleep(60)

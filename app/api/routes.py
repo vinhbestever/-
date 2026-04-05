@@ -1,3 +1,4 @@
+import asyncio
 from fastapi import APIRouter, HTTPException, Query
 
 from app.models.call_log import (
@@ -18,6 +19,11 @@ from app.services.ingest_queue import ingest_queue, QueueFullError
 router = APIRouter()
 
 
+async def _embed_async(text: str) -> list[float]:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, embedding_service.embed, text)
+
+
 # ── Direct ingest (utterances already available) ──────────────
 
 
@@ -28,7 +34,7 @@ async def create_call_log(payload: CallLogCreate):
         f"{u.speaker}: {u.text}" for u in payload.utterances
     )
 
-    vector = embedding_service.embed(full_text)
+    vector = await _embed_async(full_text)
 
     doc = CallLogDocument(
         call_id=payload.call_id,
@@ -152,12 +158,12 @@ async def get_call_log(call_id: str):
 @router.post("/search/semantic", response_model=SearchResult)
 async def semantic_search(req: SemanticSearchRequest):
     """Pure semantic (vector) search — find calls by meaning."""
-    query_vector = embedding_service.embed(req.query)
+    query_vector = await _embed_async(req.query)
     return await es_service.semantic_search(query_vector, req)
 
 
 @router.post("/search/hybrid", response_model=SearchResult)
 async def hybrid_search(req: SemanticSearchRequest):
     """Hybrid search — combines vector similarity with BM25 full-text."""
-    query_vector = embedding_service.embed(req.query)
+    query_vector = await _embed_async(req.query)
     return await es_service.hybrid_search(req.query, query_vector, req)
