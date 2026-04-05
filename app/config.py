@@ -19,6 +19,16 @@ class Settings(BaseSettings):
     embedding_model: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
     embedding_dims: int = 384
 
+    # STT
+    stt_api_url: str = "http://localhost:8001/transcribe"
+    stt_max_concurrency: int = 5
+    stt_timeout_seconds: int = 300
+    stt_max_retries: int = 3
+
+    # Ingest worker
+    ingest_worker_count: int = 3
+    ingest_queue_max_size: int = 1000
+
     # API
     api_host: str = "0.0.0.0"
     api_port: int = 8000

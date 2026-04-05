@@ -4,13 +4,21 @@ from app.models.call_log import (
     CallLogCreate,
     CallLogDocument,
     CallLogResponse,
+    IngestRequest,
+    IngestJobResponse,
+    IngestJobDetail,
     SemanticSearchRequest,
     SearchResult,
+    JobStatus,
 )
 from app.services.elasticsearch_service import es_service
 from app.services.embedding_service import embedding_service
+from app.services.ingest_queue import ingest_queue
 
 router = APIRouter()
+
+
+# ── Direct ingest (utterances already available) ──────────────
 
 
 @router.post("/call-logs", response_model=CallLogResponse, status_code=201)
@@ -59,6 +67,51 @@ async def create_call_log(payload: CallLogCreate):
     )
 
 
+# ── Async ingest (submit audio → background STT → embed → store) ─
+
+
+@router.post("/ingest", response_model=IngestJobResponse, status_code=202)
+async def submit_ingest(req: IngestRequest):
+    """
+    Submit a call for async processing.
+    Returns immediately with a job_id. The service calls the STT API in the
+    background with concurrency control, then embeds and stores the result.
+    """
+    job = await ingest_queue.submit(req)
+    return IngestJobResponse(
+        job_id=job.job_id,
+        call_id=job.call_id,
+        status=job.status,
+        message=f"Queued for processing (position ~{job.queue_position})",
+    )
+
+
+@router.get("/ingest/{job_id}", response_model=IngestJobDetail)
+async def get_ingest_status(job_id: str):
+    """Check the status of an async ingest job."""
+    job = ingest_queue.get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
+@router.get("/ingest", response_model=dict)
+async def get_queue_stats():
+    """Overview of the ingest queue."""
+    jobs = ingest_queue.jobs
+    return {
+        "queue_pending": ingest_queue.pending_count,
+        "total_jobs": len(jobs),
+        "by_status": {
+            s.value: sum(1 for j in jobs.values() if j.status == s)
+            for s in JobStatus
+        },
+    }
+
+
+# ── Read ──────────────────────────────────────────────────────
+
+
 @router.get("/call-logs", response_model=SearchResult)
 async def list_call_logs(
     page: int = Query(1, ge=1),
@@ -89,6 +142,9 @@ async def get_call_log(call_id: str):
         tags=doc.tags,
         indexed_at=doc.indexed_at,
     )
+
+
+# ── Search ────────────────────────────────────────────────────
 
 
 @router.post("/search/semantic", response_model=SearchResult)

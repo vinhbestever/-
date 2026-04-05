@@ -18,6 +18,15 @@ class CallStatus(str, Enum):
     ONGOING = "ongoing"
 
 
+class JobStatus(str, Enum):
+    QUEUED = "queued"
+    CALLING_STT = "calling_stt"
+    EMBEDDING = "embedding"
+    INDEXING = "indexing"
+    DONE = "done"
+    FAILED = "failed"
+
+
 class Speaker(BaseModel):
     id: Optional[str] = None
     name: Optional[str] = None
@@ -33,8 +42,11 @@ class Utterance(BaseModel):
     end_time: Optional[float] = None
 
 
+# ── Direct ingest (utterances already available) ──────────────
+
+
 class CallLogCreate(BaseModel):
-    """Payload received from the STT API — conversation already split by speakers."""
+    """Payload when utterances are already available from the STT API."""
     call_id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
     direction: CallDirection = CallDirection.INBOUND
     status: CallStatus = CallStatus.COMPLETED
@@ -48,6 +60,46 @@ class CallLogCreate(BaseModel):
     source_system: Optional[str] = None
     tags: list[str] = Field(default_factory=list)
     metadata: dict = Field(default_factory=dict)
+
+
+# ── Async ingest (service calls STT in background) ───────────
+
+
+class IngestRequest(BaseModel):
+    """Submit a call for async processing: STT → embed → store."""
+    call_id: Optional[str] = Field(default_factory=lambda: str(uuid.uuid4()))
+    audio_url: str = Field(..., min_length=1)
+    direction: CallDirection = CallDirection.INBOUND
+    status: CallStatus = CallStatus.COMPLETED
+    speaker_a: Optional[Speaker] = None
+    speaker_b: Optional[Speaker] = None
+    call_start_time: Optional[datetime] = None
+    call_end_time: Optional[datetime] = None
+    duration_seconds: Optional[float] = None
+    language: str = "vi"
+    source_system: Optional[str] = None
+    tags: list[str] = Field(default_factory=list)
+    metadata: dict = Field(default_factory=dict)
+
+
+class IngestJobResponse(BaseModel):
+    job_id: str
+    call_id: str
+    status: JobStatus
+    message: str
+
+
+class IngestJobDetail(BaseModel):
+    job_id: str
+    call_id: str
+    status: JobStatus
+    error: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+    queue_position: Optional[int] = None
+
+
+# ── Elasticsearch document ────────────────────────────────────
 
 
 class CallLogDocument(BaseModel):
@@ -68,6 +120,9 @@ class CallLogDocument(BaseModel):
     metadata: dict = Field(default_factory=dict)
     embedding: list[float] = Field(default_factory=list)
     indexed_at: datetime = Field(default_factory=datetime.utcnow)
+
+
+# ── Response / search models ─────────────────────────────────
 
 
 class CallLogResponse(BaseModel):

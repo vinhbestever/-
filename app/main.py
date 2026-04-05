@@ -6,6 +6,7 @@ from app.config import settings
 from app.api.routes import router
 from app.services.elasticsearch_service import es_service
 from app.services.embedding_service import embedding_service
+from app.services.ingest_queue import ingest_queue
 
 structlog.configure(
     processors=[
@@ -24,7 +25,9 @@ structlog.configure(
 async def lifespan(app: FastAPI):
     dims = embedding_service.dims
     await es_service.ensure_index(dims)
+    await ingest_queue.start()
     yield
+    await ingest_queue.stop()
     await es_service.close()
 
 
@@ -50,5 +53,6 @@ async def health():
     return {
         "status": "healthy" if es_ok else "degraded",
         "elasticsearch": "connected" if es_ok else "disconnected",
+        "ingest_queue_pending": ingest_queue.pending_count,
         "version": settings.app_version,
     }
