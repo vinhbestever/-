@@ -1,130 +1,195 @@
 # Kiến trúc chi tiết — Call Log Service
 
-## Thiết kế
+## Tổng quan
 
-Service hỗ trợ 2 luồng nhận dữ liệu:
+Service có một luồng duy nhất: nhận `audio_url` → gọi STT API trong background → embed → lưu Elasticsearch → search.
 
-1. **Đồng bộ** (`POST /call-logs`): Khi utterances đã có sẵn → embed + index ngay
-2. **Bất đồng bộ** (`POST /ingest`): Gửi audio URL → service tự gọi STT API trong background
+Không dùng Kafka, Redis, hay Celery. Toàn bộ xử lý bất đồng bộ chạy trong `asyncio` event loop của FastAPI.
 
-## Vấn đề: STT API chậm khi nhiều request
-
-STT API thường xử lý chậm (vài giây đến vài phút/cuộc gọi) và dễ bị quá tải khi nhận nhiều request cùng lúc. Giải pháp:
-
-### asyncio.Queue + Worker Pool + Semaphore
-
-```
-POST /ingest (trả 202 ngay)
-    │
-    ▼
-asyncio.Queue (bounded, max 1000)
-    │
-    ├── Worker 0 ──┐
-    ├── Worker 1 ──┤
-    └── Worker 2 ──┘
-                   │
-                   ▼
-         asyncio.Semaphore (max 5 concurrent)
-                   │
-                   ▼
-             STT API call
-                   │
-                   ▼
-              embed (5ms)
-                   │
-                   ▼
-            index vào ES
-```
-
-**Tại sao cách này đủ, không cần Kafka hay Redis Queue:**
-
-- `asyncio.Queue` là bounded queue trong memory — backpressure tự nhiên khi queue đầy
-- Worker pool (`INGEST_WORKER_COUNT=3`) chạy song song, dequeue và xử lý
-- `asyncio.Semaphore` (`STT_MAX_CONCURRENCY=5`) giới hạn số request đồng thời tới STT API, bảo vệ STT khỏi quá tải
-- Tất cả chạy trong cùng event loop của FastAPI, không cần thêm infra
-- Job status tracking in-memory, client poll qua `GET /ingest/{job_id}`
-
-**Khi nào cần nâng cấp:**
-
-- **Multi-instance**: Nếu chạy nhiều API instances, queue in-memory không share được → chuyển sang Redis Queue hoặc Celery
-- **Durability**: Nếu cần đảm bảo không mất job khi service restart → thêm persistent queue (Redis, PostgreSQL)
-
-## Data Flow chi tiết
-
-### Luồng bất đồng bộ
+## Data Flow
 
 ```
 Client                    Call Log Service                   STT API        Elasticsearch
   │                            │                               │                │
   │── POST /ingest ──────────▶│                               │                │
-  │                            │── put vào Queue              │                │
+  │   {audio_url}              │── put_nowait vào Queue       │                │
+  │                            │   (429 nếu queue đầy)        │                │
   │◀── 202 {job_id, queued} ──│                               │                │
   │                            │                               │                │
-  │                            │── Worker dequeue ────────────▶│                │
-  │                            │   (Semaphore acquire)         │                │
+  │                            │── Worker dequeue              │                │
+  │                            │── Semaphore acquire ─────────▶│                │
   │                            │                               │── transcribe   │
-  │                            │                               │   (chậm...)    │
-  │── GET /ingest/{id} ──────▶│                               │                │
+  │── GET /ingest/{id} ──────▶│                               │   (chậm...)    │
   │◀── {status: calling_stt} ─│                               │                │
   │                            │◀── utterances ────────────────│                │
-  │                            │   (Semaphore release)         │                │
-  │                            │── embed(full_text) ──▶ vector │                │
-  │                            │── index(doc) ─────────────────────────────────▶│
+  │                            │── Semaphore release           │                │
+  │                            │                               │                │
+  │                            │── embed (run_in_executor) ──▶ vector           │
+  │                            │── index ──────────────────────────────────────▶│
   │                            │                               │                │
   │── GET /ingest/{id} ──────▶│                               │                │
   │◀── {status: done} ────────│                               │                │
+  │                            │                               │                │
+  │── POST /search/semantic ──▶│                               │                │
+  │                            │── embed query ──▶ vector      │                │
+  │                            │── kNN search ─────────────────────────────────▶│
+  │◀── results ───────────────│◀───────────────────────────────────────────────│
 ```
 
-### Luồng đồng bộ
+## Tại sao asyncio.Queue, không phải Kafka/Redis/Celery
+
+| Yếu tố | asyncio.Queue | Kafka/Redis/Celery |
+|---------|---------------|-------------------|
+| Infra thêm | Không | Cần broker (Redis/RabbitMQ) |
+| RAM cho embedding | 1 bản model (~500MB) | N bản model (N worker processes) |
+| Concurrency control | Semaphore trong 1 event loop | Distributed lock phức tạp |
+| Phù hợp cho | I/O-bound (chờ STT API) | CPU-bound nặng |
+| Job status granularity | 6 trạng thái chi tiết | PENDING/STARTED/SUCCESS/FAILURE |
+| Khi nào cần nâng cấp | Multi-instance, cần durability | — |
+
+Nút cổ chai là **STT API call** (I/O-bound, vài giây đến vài phút). `asyncio` + `Semaphore` xử lý I/O concurrency với gần zero overhead, không cần process riêng.
+
+## Ingest Queue — Chi tiết
 
 ```
-Client ── POST /call-logs ──▶ embed ──▶ index ──▶ 201 response
+POST /ingest
+    │
+    ▼
+put_nowait()  ───▶  asyncio.Queue (bounded, max 1000)
+                         │
+                         │  (nếu đầy → QueueFullError → API trả 429)
+                         │
+                    ┌────┴────┐
+                    │ Workers │  (INGEST_WORKER_COUNT, default 3)
+                    └────┬────┘
+                         │
+                         ▼
+              asyncio.Semaphore (STT_MAX_CONCURRENCY, default 5)
+                         │
+                    ┌────┴────┐
+                    │ STT API │  tenacity retry (3 lần, backoff 2-30s)
+                    └────┬────┘
+                         │
+                         ▼
+              run_in_executor ──▶ embed (thread pool, không block event loop)
+                         │
+                         ▼
+                   Elasticsearch index
+                         │
+                         ▼
+                  job.status = DONE
 ```
 
-## Cơ chế bảo vệ STT API
+### Cơ chế bảo vệ
 
-| Cơ chế | Config | Mục đích |
+| Cơ chế | Vị trí | Mục đích |
 |--------|--------|----------|
-| **Semaphore** | `STT_MAX_CONCURRENCY=5` | Giới hạn request đồng thời tới STT |
-| **Queue bounded** | `INGEST_QUEUE_MAX_SIZE=1000` | Reject request khi queue đầy (backpressure) |
-| **Retry + backoff** | `STT_MAX_RETRIES=3`, exponential 2-30s | Tự retry khi STT timeout/lỗi mạng |
-| **Timeout** | `STT_TIMEOUT_SECONDS=300` | Không chờ vô hạn |
+| `put_nowait` + 429 | `submit()` | API không bao giờ bị treo khi queue đầy |
+| `Semaphore(5)` | `_process_job()` | STT API không bị quá tải |
+| `run_in_executor` | `_process_job()` | Embed không block event loop |
+| TTL cleanup (1h) | `_cleanup_loop()` | Jobs xong bị xóa, không leak memory |
+| Graceful shutdown (30s) | `stop()` | Chờ in-flight jobs xong trước khi tắt |
+| Retry + backoff | `stt_client.transcribe()` | Tự retry khi STT timeout/lỗi mạng |
 
-## Elasticsearch Mapping
+### Job Lifecycle
 
-### dense_vector field
+```
+QUEUED → CALLING_STT → EMBEDDING → INDEXING → DONE
+                                              ↘ FAILED (nếu có lỗi)
+```
+
+Client poll `GET /ingest/{job_id}` để biết job đang ở step nào. Jobs `DONE`/`FAILED` tự động bị xóa sau 1 giờ.
+
+## Elasticsearch
+
+### Index Mapping
+
+```
+call-logs/
+├── call_id           (keyword)
+├── direction         (keyword)       — inbound / outbound / internal
+├── status            (keyword)       — completed / missed / failed
+├── speaker_a         (object)        — {name, phone_number, role}
+├── speaker_b         (object)        — {name, phone_number, role}
+├── utterances        (nested)        — [{speaker, text, start_time, end_time}]
+├── full_text         (text)          — Vietnamese analyzer, BM25 searchable
+├── embedding         (dense_vector)  — 384 dims, HNSW index, cosine similarity
+├── call_start_time   (date)
+├── duration_seconds  (float)
+├── language          (keyword)
+├── tags              (keyword)
+├── metadata          (object)
+└── indexed_at        (date)
+```
+
+### Vietnamese Analyzer
 
 ```json
 {
-  "embedding": {
-    "type": "dense_vector",
-    "dims": 384,
-    "index": true,
-    "similarity": "cosine"
+  "vn_analyzer": {
+    "type": "custom",
+    "tokenizer": "standard",
+    "filter": ["lowercase", "asciifolding"]
   }
 }
 ```
 
-- `index: true` bật HNSW graph cho approximate kNN
-- `similarity: cosine` phù hợp với normalized embeddings
-- 384 dims từ paraphrase-multilingual-MiniLM-L12-v2
+`asciifolding` cho phép tìm "khieu nai" match "khiếu nại".
 
-## Search Strategy
+### Search Strategy
 
-### Semantic Search (pure kNN)
+**Semantic Search** (`POST /search/semantic`):
+- Embed query → kNN tìm cuộc gọi gần nhất về nghĩa
+- "Khách phàn nàn sản phẩm hỏng" match "khiếu nại đơn hàng bị lỗi" dù dùng từ khác
 
-Tìm cuộc gọi gần nghĩa nhất. Query "khách hàng không hài lòng về sản phẩm" match được "khiếu nại đơn hàng bị lỗi" dù dùng từ khác.
+**Hybrid Search** (`POST /search/hybrid`):
+- Kết hợp kNN (ngữ nghĩa) + BM25 (từ khóa chính xác)
+- Elasticsearch tự combine scores
+- Tốt nhất khi query vừa mang nghĩa vừa chứa từ khóa cụ thể
 
-### Hybrid Search (kNN + BM25)
+Cả hai đều hỗ trợ filters: `direction`, `tags`, `date_from/date_to`.
 
-Kết hợp 2 signal:
-- **kNN score**: Ngữ nghĩa giống nhau
-- **BM25 score**: Từ khóa khớp chính xác
+## Embedding Model
 
-Elasticsearch tự combine scores. Hybrid thường tốt nhất khi query vừa mang nghĩa vừa chứa từ khóa cụ thể.
+**`paraphrase-multilingual-MiniLM-L12-v2`**:
+- 50+ ngôn ngữ bao gồm tiếng Việt
+- 384 dims — nhẹ, nhanh (~5ms/sentence trên CPU)
+- Normalized → cosine similarity = dot product
+- Đổi model khác qua `CALLLOG_EMBEDDING_MODEL`
+
+## Production Features
+
+### Observability
+
+| Feature | Implementation |
+|---------|---------------|
+| Metrics | Prometheus (`/metrics`): request latency, queue depth, STT duration, embed duration, job counts |
+| Tracing | `X-Request-ID` header propagated qua structlog context |
+| Logging | JSON (production), Console (debug=true) |
+| Health | `/health` — ES connectivity + queue pending count |
+
+### Resilience
+
+| Feature | Implementation |
+|---------|---------------|
+| STT retry | tenacity: 3 lần, exponential backoff 2-30s |
+| Queue backpressure | Bounded queue + 429 khi đầy |
+| Event loop safety | Embedding trong thread pool |
+| Memory safety | TTL cleanup jobs sau 1h |
+| Graceful shutdown | Drain in-flight jobs tối đa 30s |
+
+### Docker
+
+- Multi-stage build (image nhẹ)
+- Non-root user (`appuser`)
+- Built-in HEALTHCHECK
+- uvloop (event loop nhanh hơn ~25%)
 
 ## Scaling
 
-- **Vertical**: Tăng `STT_MAX_CONCURRENCY` và `INGEST_WORKER_COUNT`
-- **Horizontal**: Chạy nhiều API instances (cần chuyển queue sang Redis)
-- **Elasticsearch**: Horizontal scaling qua sharding
+| Hướng | Cách |
+|-------|------|
+| **Vertical** | Tăng `STT_MAX_CONCURRENCY`, `INGEST_WORKER_COUNT` |
+| **Horizontal** | Nhiều API instances sau load balancer (mỗi instance có queue riêng, LB phân đều) |
+| **Elasticsearch** | Thêm shard / node |
+| **Khi cần shared queue** | Chuyển sang arq (async Redis queue) — nhẹ, tương thích asyncio |
