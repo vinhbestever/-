@@ -4,6 +4,7 @@ import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.routing import Match
 from prometheus_client import Counter, Histogram, Gauge
 
 logger = structlog.get_logger(__name__)
@@ -53,7 +54,7 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
         response: Response = await call_next(request)
         duration = time.perf_counter() - start
 
-        endpoint = request.url.path
+        endpoint = self._get_route_template(request)
         method = request.method
         status = str(response.status_code)
 
@@ -71,3 +72,14 @@ class RequestTracingMiddleware(BaseHTTPMiddleware):
         response.headers["X-Request-ID"] = request_id
         structlog.contextvars.unbind_contextvars("request_id")
         return response
+
+    @staticmethod
+    def _get_route_template(request: Request) -> str:
+        """Return the route template (e.g. /api/v1/ingest/{job_id}) instead of
+        the raw path to avoid Prometheus label cardinality explosion."""
+        app = request.app
+        for route in app.routes:
+            match, _ = route.matches(request.scope)
+            if match == Match.FULL:
+                return route.path
+        return request.url.path

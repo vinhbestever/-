@@ -45,6 +45,7 @@ class IngestQueue:
         self._semaphore: asyncio.Semaphore | None = None
         self._cleanup_task: asyncio.Task | None = None
         self._running = False
+        self._draining = False
         self._in_flight = 0
 
     @property
@@ -74,13 +75,15 @@ class IngestQueue:
         )
 
     async def stop(self):
-        self._running = False
+        self._draining = True
 
-        # Drain: wait for in-flight jobs to finish (up to 30s)
+        # Drain: let workers finish remaining queue items + in-flight jobs (up to 30s)
         for _ in range(300):
             if self._in_flight == 0 and self.pending_count == 0:
                 break
             await asyncio.sleep(0.1)
+
+        self._running = False
 
         if self._cleanup_task:
             self._cleanup_task.cancel()
@@ -104,6 +107,9 @@ class IngestQueue:
             status=JobStatus.QUEUED,
             created_at=datetime.now(timezone.utc),
         )
+
+        if self._draining:
+            raise QueueFullError("Service is shutting down. Try again later.")
 
         try:
             self._queue.put_nowait((job.job_id, req))
@@ -151,10 +157,10 @@ class IngestQueue:
         try:
             # Step 1: Call STT API (rate-limited by semaphore)
             job.status = JobStatus.CALLING_STT
-            t0 = time.perf_counter()
             async with self._semaphore:
+                t0 = time.perf_counter()
                 utterances = await stt_client.transcribe(req.audio_url, req.language)
-            STT_CALL_DURATION.observe(time.perf_counter() - t0)
+                STT_CALL_DURATION.observe(time.perf_counter() - t0)
 
             # Step 2: Embed in thread pool
             job.status = JobStatus.EMBEDDING

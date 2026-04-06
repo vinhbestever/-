@@ -238,6 +238,8 @@ class ElasticsearchService:
             "knn": knn,
             "size": req.size,
         }
+        if req.min_score is not None:
+            body["min_score"] = req.min_score
 
         result = await client.search(
             index=settings.elasticsearch_call_log_index,

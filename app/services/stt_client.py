@@ -8,6 +8,15 @@ from app.models.call_log import Utterance
 logger = structlog.get_logger(__name__)
 
 
+def _build_retry():
+    return retry(
+        stop=stop_after_attempt(settings.stt_max_retries),
+        wait=wait_exponential(multiplier=2, min=2, max=30),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
+        reraise=True,
+    )
+
+
 class STTClient:
     """HTTP client for the external Speech-to-Text API."""
 
@@ -25,12 +34,6 @@ class STTClient:
         if self._client and not self._client.is_closed:
             await self._client.aclose()
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=2, min=2, max=30),
-        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError)),
-        reraise=True,
-    )
     async def transcribe(self, audio_url: str, language: str = "vi") -> list[Utterance]:
         """
         Call the STT API and return parsed utterances.
@@ -43,21 +46,26 @@ class STTClient:
           ]
         }
         """
-        client = await self.get_client()
+        return await self._transcribe_with_retry(audio_url, language)
 
-        logger.info("Calling STT API", audio_url=audio_url, language=language)
+    async def _transcribe_with_retry(self, audio_url: str, language: str) -> list[Utterance]:
+        retrier = _build_retry()
 
-        resp = await client.post(
-            settings.stt_api_url,
-            json={"audio_url": audio_url, "language": language},
-        )
-        resp.raise_for_status()
+        @retrier
+        async def _call():
+            client = await self.get_client()
+            logger.info("Calling STT API", audio_url=audio_url, language=language)
+            resp = await client.post(
+                settings.stt_api_url,
+                json={"audio_url": audio_url, "language": language},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            utterances = [Utterance(**u) for u in data["utterances"]]
+            logger.info("STT complete", audio_url=audio_url, utterance_count=len(utterances))
+            return utterances
 
-        data = resp.json()
-        utterances = [Utterance(**u) for u in data["utterances"]]
-
-        logger.info("STT complete", audio_url=audio_url, utterance_count=len(utterances))
-        return utterances
+        return await _call()
 
 
 stt_client = STTClient()
